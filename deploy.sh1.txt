@@ -1,48 +1,94 @@
 #!/bin/bash
-set -e
 
-echo "🔍 Starting SP/FN deploy process..."
-echo "🌐 DB_HOST: $DB_HOST"
-echo "🗄️  DB_NAME: $DB_NAME"
-echo "👤 DB_USER: $DB_USER"
+echo "🔍 Searching for *.sql files..."
 
-for sql_file in *.sql; do
+SQL_FILES=$(find . -type f -name "*.sql")
+
+if [[ -z "$SQL_FILES" ]]; then
+  echo "❌ No .sql files found!"
+  exit 1
+fi
+
+for SQL_FILE in $SQL_FILES; do
   echo "---------------------------------------"
-  echo "➡️ File: $sql_file"
+  echo "➡️ File: $SQL_FILE"
 
-  # Find CREATE statement
-  SP_LINE=$(grep -i -m1 -E 'CREATE[[:space:]]+(DEFINER[[:space:]]*=[^[:space:]]+[[:space:]]*)?(PROCEDURE|FUNCTION)[[:space:]]+' "$sql_file" || true)
+  NAME=$(grep -iE 'CREATE[[:space:]]+(DEFINER[[:space:]]*=[^ ]+[[:space:]]*)?(PROCEDURE|FUNCTION)[[:space:]]+`[^`]+`' "$SQL_FILE" | \
+    sed -E 's/.*(PROCEDURE|FUNCTION)[[:space:]]+`([^`]+)`.*/\2/I' | head -n 1)
 
-  if [ -z "$SP_LINE" ]; then
-    echo "⚠️  No valid CREATE PROCEDURE/FUNCTION found — skipping $sql_file"
+  if [[ -z "$NAME" ]]; then
+    echo "⚠️  No PROCEDURE or FUNCTION found — skipping."
     continue
   fi
 
-  SP_TYPE=$(echo "$SP_LINE" | grep -ioE 'PROCEDURE|FUNCTION')
-  SP_NAME=$(echo "$SP_LINE" | sed -E "s/.*${SP_TYPE}[[:space:]]+([^\\( ]*).*/\\1/I")
+  echo "➡️ SP/FN Name: $NAME"
 
-  echo "📚 Type: $SP_TYPE"
-  echo "📛 Name: $SP_NAME"
+  TYPE=$(grep -iE 'CREATE[[:space:]]+(DEFINER[[:space:]]*=[^ ]+[[:space:]]*)?(PROCEDURE|FUNCTION)[[:space:]]+`[^`]+`' "$SQL_FILE" | \
+    sed -E 's/.*(PROCEDURE|FUNCTION).*/\1/I' | head -n 1)
 
-  # Check if exists
+  echo "📚 Detected TYPE: $TYPE"
+
+  # 1️⃣ Check if it exists
   EXISTS=$(mysql -N -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
-    SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES
-    WHERE ROUTINE_SCHEMA = '$DB_NAME'
-      AND ROUTINE_TYPE = UPPER('${SP_TYPE}')
-      AND ROUTINE_NAME = '${SP_NAME}';
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES 
+    WHERE ROUTINE_SCHEMA = '$DB_NAME' AND ROUTINE_TYPE = UPPER('$TYPE') AND ROUTINE_NAME = '$NAME';
   ")
 
-  if [ "$EXISTS" -eq 1 ]; then
-    echo "🔄 $SP_TYPE $SP_NAME exists — dropping first."
-    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
-      -e "DROP ${SP_TYPE} IF EXISTS \`${SP_NAME}\`;"
+  if [[ "$EXISTS" -eq 1 ]]; then
+    echo "✅ $TYPE $NAME exists — comparing definitions..."
+
+    # 2️⃣ Dump current DB version
+    mysql -N -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "SHOW CREATE $TYPE \`$NAME\`\\G" > "__db_create.sql"
+
+    # 3️⃣ Extract CREATE part from the file for fair comparison
+    grep -i -A 1000 'CREATE' "$SQL_FILE" | sed '/^DELIMITER/Id' > "__file_create.sql"
+
+    # Normalize both (remove DEFINER and whitespace)
+    sed -i -E 's/DEFINER=`[^`]+`@`[^`]+`//g; s/[[:space:]]+/ /g' __db_create.sql
+    sed -i -E 's/DEFINER=`[^`]+`@`[^`]+`//g; s/[[:space:]]+/ /g' __file_create.sql
+
+    DIFF=$(diff -q __db_create.sql __file_create.sql)
+
+    if [[ -z "$DIFF" ]]; then
+      echo "✅ No changes detected — skipping deploy for $NAME"
+      rm -f __db_create.sql __file_create.sql
+      continue
+    else
+      echo "🔄 Changes detected — dropping existing $TYPE $NAME"
+      mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DROP $TYPE IF EXISTS \`$NAME\`;"
+      rm -f __db_create.sql __file_create.sql
+    fi
   else
-    echo "🆕 $SP_TYPE $SP_NAME does not exist — will create new."
+    echo "🆕 $TYPE $NAME does not exist — will create new."
   fi
 
-  echo "🚀 Deploying $SP_TYPE: $SP_NAME"
-  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$sql_file"
-  echo "✅ Deployed: $SP_NAME"
-done
+  # 4️⃣ Validate using TEMP
+  TEMP_NAME="${NAME}_temp"
+  TEMP_SQL="__temp.sql"
 
-echo "🎉 All done!"
+  sed -E "s/(${TYPE}[[:space:]]+)(\`?$NAME\`?)/\\1\`$TEMP_NAME\`/I" "$SQL_FILE" > "$TEMP_SQL"
+
+  echo "📤 Testing temp: $TEMP_NAME"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$TEMP_SQL"
+
+  if [[ $? -ne 0 ]]; then
+    echo "❌ Temp $TYPE failed for $SQL_FILE"
+    rm -f "$TEMP_SQL"
+    continue
+  fi
+
+  echo "✅ Temp $TYPE OK — cleaning up temp"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "DROP $TYPE IF EXISTS \`$TEMP_NAME\`;"
+
+  echo "🚀 Deploying original: $NAME"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$SQL_FILE"
+
+  if [[ $? -eq 0 ]]; then
+    echo "✅ Deployed: $NAME"
+  else
+    echo "❌ Deploy failed: $NAME"
+  fi
+
+  rm -f "$TEMP_SQL"
+
+done
