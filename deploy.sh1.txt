@@ -1,0 +1,48 @@
+#!/bin/bash
+set -e
+
+echo "🔍 Starting SP/FN deploy process..."
+echo "🌐 DB_HOST: $DB_HOST"
+echo "🗄️  DB_NAME: $DB_NAME"
+echo "👤 DB_USER: $DB_USER"
+
+for sql_file in *.sql; do
+  echo "---------------------------------------"
+  echo "➡️ File: $sql_file"
+
+  # Find CREATE statement
+  SP_LINE=$(grep -i -m1 -E 'CREATE[[:space:]]+(DEFINER[[:space:]]*=[^[:space:]]+[[:space:]]*)?(PROCEDURE|FUNCTION)[[:space:]]+' "$sql_file" || true)
+
+  if [ -z "$SP_LINE" ]; then
+    echo "⚠️  No valid CREATE PROCEDURE/FUNCTION found — skipping $sql_file"
+    continue
+  fi
+
+  SP_TYPE=$(echo "$SP_LINE" | grep -ioE 'PROCEDURE|FUNCTION')
+  SP_NAME=$(echo "$SP_LINE" | sed -E "s/.*${SP_TYPE}[[:space:]]+([^\\( ]*).*/\\1/I")
+
+  echo "📚 Type: $SP_TYPE"
+  echo "📛 Name: $SP_NAME"
+
+  # Check if exists
+  EXISTS=$(mysql -N -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" -e "
+    SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES
+    WHERE ROUTINE_SCHEMA = '$DB_NAME'
+      AND ROUTINE_TYPE = UPPER('${SP_TYPE}')
+      AND ROUTINE_NAME = '${SP_NAME}';
+  ")
+
+  if [ "$EXISTS" -eq 1 ]; then
+    echo "🔄 $SP_TYPE $SP_NAME exists — dropping first."
+    mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" \
+      -e "DROP ${SP_TYPE} IF EXISTS \`${SP_NAME}\`;"
+  else
+    echo "🆕 $SP_TYPE $SP_NAME does not exist — will create new."
+  fi
+
+  echo "🚀 Deploying $SP_TYPE: $SP_NAME"
+  mysql -h "$DB_HOST" -u "$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$sql_file"
+  echo "✅ Deployed: $SP_NAME"
+done
+
+echo "🎉 All done!"
