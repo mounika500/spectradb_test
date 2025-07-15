@@ -1,0 +1,152 @@
+pipeline {
+  agent any
+
+  environment {
+    SQL_FILES = ''
+  }
+
+  stages {
+
+    stage('Checkout Code') {
+      steps {
+        script {
+          def branchName = env.BRANCH_NAME ?: 'dev'
+          echo "============================"
+          echo "🔀 [Checkout Code] Branch Name Detected: ${branchName}"
+          echo "============================"
+
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: "*/${branchName}"]],
+            userRemoteConfigs: [[
+              url: 'https://bitbucket.org/bridgera1/spectranet-db.git',
+              credentialsId: 'Bitbucket'
+            ]]
+          ])
+
+          echo "✅ Checked out branch: ${branchName}"
+          env.RESOLVED_BRANCH = branchName
+        }
+      }
+    }
+
+    stage('Download Deploy Script From Main') {
+      steps {
+        script {
+          echo "============================"
+          echo "⬇️ [Download Deploy Script] Always pulling multi_deploy.sh from main branch"
+          echo "============================"
+
+          dir('scripts') {
+            checkout([
+              $class: 'GitSCM',
+              branches: [[name: '*/main']],
+              extensions: [[$class: 'SparseCheckoutPaths',
+                sparseCheckoutPaths: [[path: 'scripts/multi_deploy.sh']]
+              ]],
+              userRemoteConfigs: [[
+                url: 'https://bitbucket.org/bridgera1/spectranet-db.git',
+                credentialsId: 'Bitbucket'
+              ]]
+            ])
+          }
+
+          echo "✅ Downloaded scripts/multi_deploy.sh from main branch."
+        }
+      }
+    }
+
+    stage('Set DB Config Per Branch') {
+      steps {
+        script {
+          def branch = env.RESOLVED_BRANCH
+          echo "============================"
+          echo "⚙️ [Set DB Config] Setting DB credentials for branch: ${branch}"
+          echo "============================"
+
+          if (branch == 'dev') {
+            env.DB_CREDS_ID = 'DB_CREDS_DEV'
+            env.DB_HOST = '18.210.9.112'
+            env.DB_NAME = 'sn_qa_new'
+          } else if (branch == 'qa') {
+            env.DB_CREDS_ID = 'DB_CREDS_QA'
+            env.DB_HOST = 'spectranetdevqauat-cluster.cluster-cscm5zsm73fc.us-east-1.rds.amazonaws.com'
+            env.DB_NAME = 'Spectranet_QA'
+          } else if (branch == 'uat') {
+            env.DB_CREDS_ID = 'DB_CREDS_UAT'
+            env.DB_HOST = 'your-uat-db-host'
+            env.DB_NAME = 'your_uat_db'
+          } else if (branch == 'prod') {
+            env.DB_CREDS_ID = 'DB_CREDS_PROD'
+            env.DB_HOST = 'your-prod-db-host'
+            env.DB_NAME = 'your_prod_db'
+          } else {
+            error "❌ Unknown branch: ${branch} — no DB config!"
+          }
+
+          echo "✅ DB Config:"
+          echo "   🔑 Credentials ID : ${env.DB_CREDS_ID}"
+          echo "   🌐 DB Host        : ${env.DB_HOST}"
+          echo "   🗄️  DB Name        : ${env.DB_NAME}"
+        }
+      }
+    }
+
+    stage('Detect & Deploy SQL Files') {
+      steps {
+        script {
+          echo "============================"
+          echo "🔎 [Detect & Deploy] Checking for modified .sql files"
+          echo "============================"
+
+          def changedSQL = sh(
+            script: '''git diff --name-only HEAD~1 HEAD | grep '.sql$' || true''',
+            returnStdout: true
+          ).trim()
+
+          echo "🧪 Debug: Raw changedSQL = '${changedSQL}'"
+
+          if (changedSQL) {
+            env.SQL_FILES = changedSQL
+            echo "📂 Found SQL files to deploy:"
+            def sqlList = changedSQL.split()
+            sqlList.each { file -> echo "   📄 ${file}" }
+
+            withCredentials([usernamePassword(
+              credentialsId: env.DB_CREDS_ID,
+              usernameVariable: 'DB_USER',
+              passwordVariable: 'DB_PASS'
+            )]) {
+              // ⚠️ Remove these debug prints once tested!
+              echo "🧪 DEBUG - DB_USER: ${DB_USER}"
+              echo "🧪 DEBUG - DB_PASS: ${DB_PASS}"
+
+              def fileArgs = sqlList.collect { "\"${it}\"" }.join(' ')
+              echo "============================"
+              echo "🚀 [Deploy] Running multi_deploy.sh with:"
+              echo "   🌐 DB Host : ${env.DB_HOST}"
+              echo "   🗄️  DB Name : ${env.DB_NAME}"
+              echo "   👤 DB User : ${DB_USER}"
+              echo "   📄 Files   : ${fileArgs}"
+              echo "============================"
+
+              sh """
+                chmod +x scripts/multi_deploy.sh
+                DB_HOST="${env.DB_HOST}" DB_NAME="${env.DB_NAME}" DB_USER="${DB_USER}" DB_PASS="${DB_PASS}" scripts/multi_deploy.sh ${fileArgs}
+              """
+            }
+          } else {
+            echo "🚫 No SQL files to deploy — skipping deployment."
+          }
+        }
+      }
+    }
+
+  }
+
+  post {
+    success { echo "✅ [Post] Pipeline completed successfully!" }
+    failure { echo "❌ [Post] Pipeline failed!" }
+    always  { echo "🏁 [Post] Pipeline finished. Branch: ${env.RESOLVED_BRANCH}" }
+  }
+}
