@@ -1,0 +1,75 @@
+pipeline {
+  agent any
+
+  environment {
+    SQL_FILES = ''
+    DB_CREDS_ID = 'DB_CREDS_QA'
+    DB_HOST = 'spectranetdevqauat-cluster.cluster-cscm5zsm73fc.us-east-1.rds.amazonaws.com'
+    DB_NAME = 'Spectranet_QA'
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        echo "✅ Checked out QA branch"
+      }
+    }
+
+    stage('Download Deploy Script') {
+      steps {
+        dir('scripts') {
+          checkout([
+            $class: 'GitSCM',
+            branches: [[name: '*/main']],
+            extensions: [[$class: 'SparseCheckoutPaths',
+              sparseCheckoutPaths: [[path: 'scripts/multi_deploy.sh']]
+            ]],
+            userRemoteConfigs: [[
+              url: 'https://bitbucket.org/bridgera1/spectranet-db.git',
+              credentialsId: 'Bitbucket'
+            ]]
+          ])
+        }
+        echo "✅ Downloaded deploy script from main"
+      }
+    }
+
+    stage('Detect & Deploy SQL Files') {
+      steps {
+        script {
+          def changedSQL = sh(
+            script: "git diff origin/qa...HEAD --name-only | grep '.sql$' || true",
+            returnStdout: true
+          ).trim()
+
+          if (changedSQL) {
+            env.SQL_FILES = changedSQL
+            def sqlList = changedSQL.split()
+            sqlList.each { echo "📄 ${it}" }
+
+            withCredentials([usernamePassword(
+              credentialsId: env.DB_CREDS_ID,
+              usernameVariable: 'DB_USER',
+              passwordVariable: 'DB_PASS'
+            )]) {
+              def fileArgs = sqlList.collect { "\"${it}\"" }.join(' ')
+              sh """
+                chmod +x scripts/multi_deploy.sh
+                DB_HOST="${env.DB_HOST}" DB_NAME="${env.DB_NAME}" DB_USER="${DB_USER}" DB_PASS="${DB_PASS}" scripts/multi_deploy.sh ${fileArgs}
+              """
+            }
+          } else {
+            echo "🚫 No SQL files to deploy"
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "✅ QA deployment successful!" }
+    failure { echo "❌ QA deployment failed!" }
+    always  { echo "🏁 Finished QA pipeline" }
+  }
+}
