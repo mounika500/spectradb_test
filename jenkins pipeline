@@ -1,6 +1,10 @@
 pipeline {
   agent any
 
+  parameters {
+    string(name: 'BRANCH_NAME', defaultValue: 'dev', description: 'Git branch to deploy')
+  }
+
   environment {
     SQL_FILES = ''
   }
@@ -10,7 +14,7 @@ pipeline {
     stage('Checkout Code') {
       steps {
         script {
-          def branchName = env.BRANCH_NAME ?: 'dev'
+          def branchName = params.BRANCH_NAME
           echo "============================"
           echo "🔀 [Checkout Code] Branch Name Detected: ${branchName}"
           echo "============================"
@@ -33,9 +37,7 @@ pipeline {
     stage('Download Deploy Script From Main') {
       steps {
         script {
-          echo "============================"
           echo "⬇️ [Download Deploy Script] Always pulling multi_deploy.sh from main branch"
-          echo "============================"
 
           dir('scripts') {
             checkout([
@@ -60,9 +62,7 @@ pipeline {
       steps {
         script {
           def branch = env.RESOLVED_BRANCH
-          echo "============================"
           echo "⚙️ [Set DB Config] Setting DB credentials for branch: ${branch}"
-          echo "============================"
 
           if (branch == 'dev') {
             env.DB_CREDS_ID = 'DB_CREDS_DEV'
@@ -95,9 +95,7 @@ pipeline {
     stage('Detect & Deploy SQL Files') {
       steps {
         script {
-          echo "============================"
           echo "🔎 [Detect & Deploy] Checking for modified .sql files"
-          echo "============================"
 
           def changedSQL = sh(
             script: '''git diff --name-only HEAD~1 HEAD | grep '.sql$' || true''',
@@ -108,7 +106,6 @@ pipeline {
 
           if (changedSQL) {
             env.SQL_FILES = changedSQL
-            echo "📂 Found SQL files to deploy:"
             def sqlList = changedSQL.split()
             sqlList.each { file -> echo "   📄 ${file}" }
 
@@ -117,18 +114,12 @@ pipeline {
               usernameVariable: 'DB_USER',
               passwordVariable: 'DB_PASS'
             )]) {
-              // ⚠️ Remove these debug prints once tested!
-              echo "🧪 DEBUG - DB_USER: ${DB_USER}"
-              echo "🧪 DEBUG - DB_PASS: ${DB_PASS}"
-
               def fileArgs = sqlList.collect { "\"${it}\"" }.join(' ')
-              echo "============================"
               echo "🚀 [Deploy] Running multi_deploy.sh with:"
               echo "   🌐 DB Host : ${env.DB_HOST}"
               echo "   🗄️  DB Name : ${env.DB_NAME}"
               echo "   👤 DB User : ${DB_USER}"
               echo "   📄 Files   : ${fileArgs}"
-              echo "============================"
 
               sh """
                 chmod +x scripts/multi_deploy.sh
